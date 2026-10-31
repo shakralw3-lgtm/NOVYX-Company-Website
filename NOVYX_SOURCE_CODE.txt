@@ -1,0 +1,534 @@
+NOVYX — THE OFFICIAL WEBSITE SOURCE CODE
+=========================================
+
+
+================================================================================
+FILE: package.json
+================================================================================
+
+{
+  "name": "novyx-company-website",
+  "version": "1.0.0",
+  "private": true,
+  "description": "NOVYX company website with admin dashboard and project request management",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.8.1",
+    "connect-sqlite3": "^0.9.16",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "express-session": "^1.18.1",
+    "helmet": "^8.0.0"
+  }
+}
+
+
+================================================================================
+FILE: .env.example
+================================================================================
+
+PORT=3000
+NODE_ENV=development
+SESSION_SECRET=replace-this-with-a-long-random-secret
+ADMIN_USERNAME=novyxadmin
+ADMIN_PASSWORD=ChangeThisToAStrongPassword123!
+
+
+================================================================================
+FILE: server.js
+================================================================================
+
+require("dotenv").config();
+
+const express = require("express");
+const session = require("express-session");
+const SQLiteStore = require("connect-sqlite3")(session);
+const Database = require("better-sqlite3");
+const bcrypt = require("bcryptjs");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const path = require("path");
+const fs = require("fs");
+
+const app = express();
+const PORT = Number(process.env.PORT || 3000);
+const isProduction = process.env.NODE_ENV === "production";
+const dataDir = path.join(__dirname, "data");
+fs.mkdirSync(dataDir, { recursive: true });
+
+if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
+  console.error("SESSION_SECRET must be set to a random value of at least 32 characters.");
+  process.exit(1);
+}
+if (!process.env.ADMIN_USERNAME || !process.env.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD.length < 12) {
+  console.error("Set ADMIN_USERNAME and ADMIN_PASSWORD (at least 12 characters) in .env before starting.");
+  process.exit(1);
+}
+
+const db = new Database(path.join(dataDir, "novyx.sqlite"));
+db.pragma("journal_mode = WAL");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS admins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    service TEXT NOT NULL,
+    budget TEXT DEFAULT '',
+    details TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'new',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+const adminExists = db.prepare("SELECT id FROM admins WHERE username = ?").get(process.env.ADMIN_USERNAME);
+if (!adminExists) {
+  const hash = bcrypt.hashSync(process.env.ADMIN_PASSWORD, 12);
+  db.prepare("INSERT INTO admins (username, password_hash) VALUES (?, ?)").run(process.env.ADMIN_USERNAME, hash);
+  console.log(`Created admin account: ${process.env.ADMIN_USERNAME}`);
+}
+
+app.disable("x-powered-by");
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:"],
+      connectSrc: ["'self'"],
+      upgradeInsecureRequests: isProduction ? [] : null
+    }
+  }
+}));
+app.use(express.json({ limit: "20kb" }));
+app.use(express.urlencoded({ extended: false, limit: "20kb" }));
+app.use(session({
+  store: new SQLiteStore({ db: "sessions.sqlite", dir: dataDir }),
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: "strict",
+    secure: isProduction,
+    maxAge: 1000 * 60 * 60 * 8
+  }
+}));
+
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: "draft-7", legacyHeaders: false });
+const requestLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 8, standardHeaders: "draft-7", legacyHeaders: false });
+
+function requireAdmin(req, res, next) {
+  if (req.session && req.session.adminId) return next();
+  return res.status(401).json({ error: "يلزم تسجيل دخول الأدمن." });
+}
+function clean(value, max = 2000) {
+  return String(value || "").trim().slice(0, max);
+}
+
+app.post("/api/requests", requestLimiter, (req, res) => {
+  const name = clean(req.body.name, 100);
+  const email = clean(req.body.email, 160).toLowerCase();
+  const phone = clean(req.body.phone, 40);
+  const service = clean(req.body.service, 100);
+  const budget = clean(req.body.budget, 100);
+  const details = clean(req.body.details, 3000);
+
+  if (!name || !email || !phone || !service || !details) {
+    return res.status(400).json({ error: "يرجى ملء جميع الحقول المطلوبة." });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: "يرجى إدخال بريد إلكتروني صحيح." });
+  }
+  if (details.length < 15) {
+    return res.status(400).json({ error: "اكتب تفاصيل أكثر عن المشروع (15 حرفًا على الأقل)." });
+  }
+
+  const result = db.prepare(`
+    INSERT INTO requests (name, email, phone, service, budget, details)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(name, email, phone, service, budget, details);
+
+  res.status(201).json({ message: "تم استلام طلبك بنجاح. سنتواصل معك لمناقشة التفاصيل.", id: result.lastInsertRowid });
+});
+
+app.post("/api/admin/login", loginLimiter, (req, res) => {
+  const username = clean(req.body.username, 80);
+  const password = String(req.body.password || "");
+  const admin = db.prepare("SELECT * FROM admins WHERE username = ?").get(username);
+  if (!admin || !bcrypt.compareSync(password, admin.password_hash)) {
+    return res.status(401).json({ error: "اسم المستخدم أو كلمة المرور غير صحيحة." });
+  }
+  req.session.regenerate(err => {
+    if (err) return res.status(500).json({ error: "تعذر إنشاء جلسة آمنة." });
+    req.session.adminId = admin.id;
+    req.session.adminUsername = admin.username;
+    res.json({ message: "تم تسجيل الدخول.", username: admin.username });
+  });
+});
+
+app.post("/api/admin/logout", requireAdmin, (req, res) => {
+  req.session.destroy(() => res.json({ message: "تم تسجيل الخروج." }));
+});
+
+app.get("/api/admin/me", requireAdmin, (req, res) => {
+  res.json({ username: req.session.adminUsername });
+});
+
+app.get("/api/admin/requests", requireAdmin, (req, res) => {
+  const rows = db.prepare("SELECT * FROM requests ORDER BY id DESC LIMIT 500").all();
+  res.json(rows);
+});
+
+app.patch("/api/admin/requests/:id", requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  const status = clean(req.body.status, 20);
+  const allowed = ["new", "reviewing", "in_progress", "completed", "rejected"];
+  if (!Number.isInteger(id) || !allowed.includes(status)) return res.status(400).json({ error: "بيانات غير صالحة." });
+  const result = db.prepare("UPDATE requests SET status = ? WHERE id = ?").run(status, id);
+  if (!result.changes) return res.status(404).json({ error: "الطلب غير موجود." });
+  res.json({ message: "تم تحديث حالة الطلب." });
+});
+
+app.delete("/api/admin/requests/:id", requireAdmin, (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: "رقم الطلب غير صالح." });
+  const result = db.prepare("DELETE FROM requests WHERE id = ?").run(id);
+  if (!result.changes) return res.status(404).json({ error: "الطلب غير موجود." });
+  res.json({ message: "تم حذف الطلب." });
+});
+
+app.get("/api/admin/stats", requireAdmin, (req, res) => {
+  const total = db.prepare("SELECT COUNT(*) AS n FROM requests").get().n;
+  const fresh = db.prepare("SELECT COUNT(*) AS n FROM requests WHERE status = 'new'").get().n;
+  const active = db.prepare("SELECT COUNT(*) AS n FROM requests WHERE status IN ('reviewing','in_progress')").get().n;
+  const completed = db.prepare("SELECT COUNT(*) AS n FROM requests WHERE status = 'completed'").get().n;
+  res.json({ total, fresh, active, completed });
+});
+
+app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));
+app.get("*", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
+
+app.listen(PORT, () => console.log(`NOVYX website running at http://localhost:${PORT}`));
+
+
+================================================================================
+FILE: public/index.html
+================================================================================
+
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#070914">
+  <meta name="description" content="NOVYX — حلول برمجية وتقنية، تطوير تطبيقات ومواقع وأنظمة رقمية.">
+  <title>NOVYX | Technology Beyond Limits</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&family=Orbitron:wght@500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#home" aria-label="NOVYX home"><span class="brand-mark">N</span><span>NOVYX</span></a>
+    <button class="menu-toggle" id="menuToggle" aria-label="فتح القائمة">☰</button>
+    <nav id="mainNav">
+      <a href="#home">الرئيسية</a><a href="#services">خدماتنا</a><a href="#about">من نحن</a><a href="#contact">اطلب مشروعك</a>
+      <a class="admin-link" href="/admin.html">دخول الإدارة</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero section" id="home">
+      <div class="hero-copy">
+        <span class="eyebrow"><i></i> شركة حلول برمجية وتقنية</span>
+        <h1>نحوّل أفكارك إلى<br><span>واقع رقمي</span></h1>
+        <p>NOVYX تقدم حلولًا برمجية مصممة لتساعد الأفراد والشركات على بناء حضور رقمي أقوى، من الفكرة وحتى الإطلاق.</p>
+        <div class="hero-actions"><a class="btn primary" href="#contact">ابدأ مشروعك <b>←</b></a><a class="btn ghost" href="#services">اكتشف خدماتنا</a></div>
+        <div class="hero-note"><span class="pulse"></span> TECHNOLOGY BEYOND LIMITS</div>
+      </div>
+      <div class="hero-art" aria-label="NOVYX digital technology emblem">
+        <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
+        <div class="hero-n">N</div><div class="hero-glow"></div>
+        <div class="code-chip chip-a">01 / CREATE</div><div class="code-chip chip-b">10 / INNOVATE</div>
+        <div class="hero-word">NOVYX</div><div class="hero-tag">TECHNOLOGY BEYOND LIMITS</div>
+      </div>
+    </section>
+
+    <section class="section" id="services">
+      <div class="section-heading"><span class="eyebrow">WHAT WE DO</span><h2>خدمات <span>NOVYX</span></h2><p>حلول رقمية متكاملة تُبنى حول احتياجات مشروعك.</p></div>
+      <div class="service-grid">
+        <article class="service-card"><div class="service-icon">▣</div><h3>تطوير تطبيقات الموبايل</h3><p>تصميم وتطوير تطبيقات عملية بواجهات سهلة وتجربة استخدام واضحة، وفق متطلبات المشروع.</p><span>Android • iOS</span></article>
+        <article class="service-card"><div class="service-icon">⌘</div><h3>تصميم وبرمجة المواقع</h3><p>مواقع تعريفية وتجارية وصفحات هبوط متجاوبة مع الهواتف والكمبيوتر، مع تجربة تصفح منظمة.</p><span>Websites • E-commerce</span></article>
+        <article class="service-card"><div class="service-icon">◇</div><h3>الأنظمة والحلول المخصصة</h3><p>أنظمة لإدارة العمليات والطلبات والعملاء، تُصمم حسب طبيعة العمل وسير إجراءاته.</p><span>Custom Software</span></article>
+        <article class="service-card"><div class="service-icon">▤</div><h3>تطوير البرامج والأدوات</h3><p>برامج وأدوات رقمية تساعد على تنظيم المهام وتسهيل العمليات اليومية.</p><span>Desktop • Tools</span></article>
+        <article class="service-card"><div class="service-icon">✧</div><h3>تطوير الألعاب</h3><p>تصميم نماذج وأفكار ألعاب وتطوير تجارب تفاعلية وفق نطاق وميزانية المشروع.</p><span>Game Development</span></article>
+        <article class="service-card"><div class="service-icon">◎</div><h3>الدعم والتحسين التقني</h3><p>مراجعة المنتجات الرقمية القائمة، ومعالجة المشكلات والتحسينات المتفق عليها.</p><span>Support • Optimization</span></article>
+      </div>
+    </section>
+
+    <section class="about section" id="about">
+      <div class="about-panel"><span class="eyebrow">ABOUT NOVYX</span><h2>التقنية تبدأ بفكرة.<br><span>والفرق يصنعه التنفيذ.</span></h2><p>NOVYX علامة تقنية تعمل على تقديم خدمات البرمجيات والحلول الرقمية. نبدأ بفهم احتياج العميل، ثم نحدد نطاق العمل ونطوّر الحل ونتابع الملاحظات حتى التسليم.</p><a href="#contact" class="text-link">تحدث معنا عن فكرتك ←</a></div>
+      <div class="principles">
+        <div><b>01</b><section><h3>وضوح في التخطيط</h3><p>تحديد المتطلبات ونطاق المشروع قبل بدء التنفيذ.</p></section></div>
+        <div><b>02</b><section><h3>اهتمام بالتجربة</h3><p>واجهات واضحة وتجربة استخدام مناسبة للجمهور المستهدف.</p></section></div>
+        <div><b>03</b><section><h3>تواصل ومتابعة</h3><p>متابعة مراحل العمل ومراجعة الملاحظات المتفق عليها.</p></section></div>
+      </div>
+    </section>
+
+    <section class="contact section" id="contact">
+      <div class="section-heading"><span class="eyebrow">START A PROJECT</span><h2>لديك فكرة؟ <span>لنبدأ</span></h2><p>أرسل تفاصيل أولية عن مشروعك وسنراجع الطلب للتواصل معك.</p></div>
+      <form id="requestForm" class="request-form">
+        <div class="form-row"><label>الاسم الكامل<input name="name" required maxlength="100" placeholder="اكتب اسمك"></label><label>البريد الإلكتروني<input name="email" type="email" required maxlength="160" placeholder="name@example.com"></label></div>
+        <div class="form-row"><label>رقم الهاتف أو واتساب<input name="phone" required maxlength="40" placeholder="+20..."></label><label>الخدمة المطلوبة<select name="service" required><option value="">اختر الخدمة</option><option>تطوير تطبيق موبايل</option><option>تصميم وبرمجة موقع</option><option>نظام أو حل برمجي مخصص</option><option>برنامج أو أداة</option><option>تطوير لعبة</option><option>دعم أو تحسين تقني</option><option>خدمة أخرى</option></select></label></div>
+        <label>الميزانية المتوقعة (اختياري)<input name="budget" maxlength="100" placeholder="مثال: يتم تحديدها بعد مناقشة التفاصيل"></label>
+        <label>تفاصيل المشروع<textarea name="details" required minlength="15" maxlength="3000" rows="5" placeholder="اشرح فكرتك والوظائف التي تحتاجها..."></textarea></label>
+        <button class="btn primary submit-btn" type="submit">إرسال طلب المشروع <b>←</b></button>
+        <p class="form-message" id="formMessage" role="status"></p>
+      </form>
+    </section>
+  </main>
+
+  <footer><a class="brand" href="#home"><span class="brand-mark">N</span><span>NOVYX</span></a><p>TECHNOLOGY BEYOND LIMITS</p><span>© <span id="year"></span> NOVYX. جميع الحقوق محفوظة.</span></footer>
+  <script src="/site.js"></script>
+</body>
+</html>
+
+
+================================================================================
+FILE: public/styles.css
+================================================================================
+
+:root{--bg:#070914;--panel:#101426;--panel2:#0c1020;--line:rgba(75,132,255,.22);--blue:#19a8ff;--purple:#a855f7;--text:#f5f7ff;--muted:#a8b0c7;--glow:0 0 35px rgba(18,133,255,.18)}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(ellipse at 78% 10%,rgba(78,39,150,.16),transparent 32%),radial-gradient(ellipse at 10% 38%,rgba(0,126,255,.12),transparent 30%),var(--bg);color:var(--text);font-family:"Cairo",sans-serif;line-height:1.8}a{color:inherit;text-decoration:none}.topbar{height:78px;padding:0 max(5vw,22px);display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid rgba(119,153,255,.13);background:rgba(7,9,20,.82);backdrop-filter:blur(14px);position:sticky;top:0;z-index:10}.brand{display:flex;align-items:center;gap:10px;font:800 25px Orbitron,sans-serif;letter-spacing:2px}.brand-mark{width:37px;height:37px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(135deg,var(--blue),var(--purple));box-shadow:0 0 22px #277bff66;color:white}.topbar nav{display:flex;align-items:center;gap:28px;color:#c6cce0;font-size:14px}.topbar nav a:hover,.text-link{color:#59bdff}.admin-link{border:1px solid var(--line);padding:7px 15px;border-radius:9px}.menu-toggle{display:none;background:none;color:white;border:0;font-size:25px}.section{padding:100px max(7vw,24px);max-width:1500px;margin:auto}.hero{min-height:620px;display:grid;grid-template-columns:1fr 1fr;align-items:center;gap:40px}.eyebrow{font:700 11px Orbitron,sans-serif;letter-spacing:2px;color:#63c5ff;display:inline-flex;align-items:center;gap:9px}.eyebrow i,.pulse{width:7px;height:7px;background:#25b8ff;border-radius:50%;box-shadow:0 0 14px #25b8ff;display:inline-block}.hero h1{font-size:clamp(38px,5vw,66px);line-height:1.3;margin:20px 0}.hero h1 span,.section-heading h2 span,.about h2 span{background:linear-gradient(90deg,#32baff,#b56cff);background-clip:text;color:transparent}.hero-copy>p,.section-heading>p,.about-panel>p{color:var(--muted);max-width:570px;font-size:16px}.hero-actions{display:flex;gap:12px;flex-wrap:wrap;margin:30px 0}.btn{display:inline-flex;justify-content:center;align-items:center;gap:20px;padding:12px 24px;border-radius:10px;border:1px solid transparent;font:700 14px "Cairo";cursor:pointer;transition:.2s}.btn:hover{transform:translateY(-2px)}.primary{background:linear-gradient(100deg,#087eea,#713ce4);color:white;box-shadow:0 9px 28px #165dcb44}.ghost{border-color:var(--line);background:#ffffff06;color:#e5eaff}.hero-note{font:11px Orbitron;color:#8f9bb8;letter-spacing:2px}.hero-art{height:440px;position:relative;display:flex;align-items:center;justify-content:center;flex-direction:column;isolation:isolate}.hero-art:before{content:"";position:absolute;width:300px;height:300px;background:radial-gradient(circle,#1269e866,transparent 68%);filter:blur(10px);z-index:-1}.orbit{position:absolute;border:1px solid #229eff66;border-radius:50%;transform:rotate(-25deg)}.orbit-one{width:370px;height:180px;box-shadow:0 0 25px #167fff33}.orbit-two{width:430px;height:250px;border-color:#a34aff55;transform:rotate(25deg)}.hero-n{font:900 230px Orbitron;background:linear-gradient(145deg,#fff,#2c9fff 48%,#9e4bff 80%);background-clip:text;color:transparent;text-shadow:0 0 55px #168bff66;line-height:1}.hero-word{font:800 36px Orbitron;letter-spacing:8px;margin-top:15px}.hero-tag{font:10px Orbitron;letter-spacing:3px;color:#a9b5d0}.code-chip{position:absolute;border:1px solid var(--line);background:#0c1730;padding:6px 10px;border-radius:6px;color:#5dc3ff;font:10px Orbitron}.chip-a{top:65px;right:5px}.chip-b{bottom:75px;left:5px}.section-heading{text-align:center;margin-bottom:45px}.section-heading h2{font-size:clamp(30px,4vw,44px);margin:8px 0}.section-heading>p{margin:0 auto}.service-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.service-card{background:linear-gradient(145deg,#111a30,#0b1020);border:1px solid var(--line);border-radius:16px;padding:26px;min-height:230px;box-shadow:var(--glow);transition:.25s}.service-card:hover{transform:translateY(-5px);border-color:#438fff88}.service-icon{width:48px;height:48px;border-radius:13px;display:grid;place-items:center;background:#117ce522;color:#58c4ff;font-size:26px;border:1px solid #269fff44}.service-card h3{font-size:18px;margin:15px 0 5px}.service-card p,.principles p{color:var(--muted);font-size:13px;margin:0 0 15px}.service-card>span{font:10px Orbitron;color:#65bfff;letter-spacing:1px}.about{display:grid;grid-template-columns:1.1fr .9fr;gap:60px;align-items:center}.about h2{font-size:38px;line-height:1.5}.text-link{font-weight:700}.principles{display:grid;gap:15px}.principles>div{display:flex;gap:18px;padding:17px;border:1px solid var(--line);border-radius:13px;background:#ffffff04}.principles b{font:700 22px Orbitron;color:#4cbcff}.principles h3{margin:0;font-size:16px}.principles p{margin:2px 0 0}.contact{max-width:900px}.request-form,.login-panel{background:linear-gradient(145deg,#11182c,#0b1020);border:1px solid var(--line);border-radius:18px;padding:30px;box-shadow:var(--glow)}label{display:flex;flex-direction:column;gap:7px;color:#dce4f8;font-size:13px;margin-bottom:16px}input,select,textarea{width:100%;background:#080d1b;border:1px solid #293858;border-radius:9px;padding:12px 14px;color:white;font:14px "Cairo";outline:none}input:focus,select:focus,textarea:focus{border-color:#2d9fff;box-shadow:0 0 0 3px #168bff20}textarea{resize:vertical}.form-row{display:grid;grid-template-columns:1fr 1fr;gap:15px}.submit-btn{width:100%;margin-top:5px}.form-message{font-size:13px;color:#6bd7a6;min-height:24px}footer{border-top:1px solid var(--line);padding:28px 7vw;display:flex;align-items:center;justify-content:space-between;gap:20px;color:var(--muted);font-size:11px}footer p{font:10px Orbitron;letter-spacing:2px}.admin-wrap{max-width:1100px;margin:55px auto;padding:0 22px;min-height:75vh}.login-panel{max-width:460px;margin:50px auto}.login-panel h1,.dashboard-head h1{margin:8px 0;font-size:30px}.login-panel>p,.dashboard-head p,.muted{color:var(--muted)}.dashboard-head,.requests-head{display:flex;justify-content:space-between;align-items:center;gap:20px}.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:30px 0}.stats-grid article{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:18px}.stats-grid span{display:block;color:var(--muted);font-size:12px}.stats-grid b{font:700 30px Orbitron;color:#61c4ff}.requests-list{display:grid;gap:13px;margin-top:18px}.request-card{border:1px solid var(--line);background:var(--panel);border-radius:13px;padding:20px}.request-top{display:flex;justify-content:space-between;gap:10px;align-items:start}.request-card h3{margin:0 0 4px}.request-card p{color:#bdc6dc;font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere}.request-meta{font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;gap:15px}.request-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}.request-actions select{width:auto;min-width:145px}.small-btn{border:1px solid var(--line);background:#151e35;color:white;border-radius:8px;padding:7px 12px;cursor:pointer}.danger{border-color:#773c55;color:#ff9db7}[hidden]{display:none!important}
+@media(max-width:800px){.topbar{height:68px}.menu-toggle{display:block}.topbar nav{display:none;position:absolute;top:68px;right:0;left:0;background:#0a0e1d;padding:18px 24px;flex-direction:column;align-items:stretch;gap:12px;border-bottom:1px solid var(--line)}.topbar nav.open{display:flex}.hero{grid-template-columns:1fr;text-align:center;padding-top:65px;gap:5px}.hero-copy>p{margin:0 auto}.hero-actions{justify-content:center}.hero-art{height:350px}.hero-n{font-size:175px}.orbit-one{width:290px;height:145px}.orbit-two{width:340px;height:190px}.service-grid{grid-template-columns:repeat(2,1fr)}.about{grid-template-columns:1fr;gap:25px}.section{padding-top:75px;padding-bottom:75px}footer{flex-wrap:wrap;justify-content:center;text-align:center}}@media(max-width:520px){.service-grid{grid-template-columns:1fr}.form-row{grid-template-columns:1fr;gap:0}.request-form,.login-panel{padding:20px}.hero-art{height:300px}.hero-n{font-size:145px}.hero-word{font-size:28px}.orbit-one{width:245px}.orbit-two{width:290px}.code-chip{font-size:8px}.stats-grid{grid-template-columns:repeat(2,1fr)}.dashboard-head,.requests-head{align-items:flex-start;flex-direction:column}.request-top{flex-direction:column}.section-heading h2{font-size:31px}}
+
+
+================================================================================
+FILE: public/site.js
+================================================================================
+
+const menuToggle = document.getElementById("menuToggle");
+const mainNav = document.getElementById("mainNav");
+menuToggle?.addEventListener("click", () => mainNav.classList.toggle("open"));
+mainNav?.querySelectorAll("a").forEach(a => a.addEventListener("click", () => mainNav.classList.remove("open")));
+document.getElementById("year").textContent = new Date().getFullYear();
+
+const form = document.getElementById("requestForm");
+const message = document.getElementById("formMessage");
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = form.querySelector("button[type=submit]");
+  button.disabled = true;
+  button.textContent = "جارٍ إرسال الطلب...";
+  message.textContent = "";
+  const payload = Object.fromEntries(new FormData(form).entries());
+  try {
+    const response = await fetch("/api/requests", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "تعذر إرسال الطلب.");
+    message.textContent = result.message;
+    form.reset();
+  } catch (error) {
+    message.textContent = error.message || "حدث خطأ. حاول مرة أخرى.";
+    message.style.color = "#ff91ad";
+  } finally {
+    button.disabled = false;
+    button.innerHTML = 'إرسال طلب المشروع <b>←</b>';
+  }
+});
+
+
+================================================================================
+FILE: public/admin.html
+================================================================================
+
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#070914"><title>إدارة NOVYX</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800&family=Orbitron:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="admin-body">
+  <header class="topbar"><a class="brand" href="/"><span class="brand-mark">N</span><span>NOVYX</span></a><a class="admin-link" href="/">العودة للموقع ↗</a></header>
+  <main class="admin-wrap">
+    <section class="login-panel" id="loginPanel">
+      <span class="eyebrow">NOVYX CONTROL CENTER</span><h1>لوحة الإدارة</h1><p>سجّل الدخول لمتابعة طلبات العملاء.</p>
+      <form id="loginForm"><label>اسم المستخدم<input name="username" required autocomplete="username"></label><label>كلمة المرور<input name="password" type="password" required autocomplete="current-password"></label><button class="btn primary submit-btn">تسجيل الدخول</button><p class="form-message" id="loginMessage" role="status"></p></form>
+    </section>
+    <section id="dashboard" hidden>
+      <div class="dashboard-head"><div><span class="eyebrow">CONTROL CENTER</span><h1>مرحبًا بك في NOVYX</h1><p>إدارة طلبات المشاريع الواردة من الموقع.</p></div><button class="btn ghost" id="logoutBtn">تسجيل الخروج</button></div>
+      <div class="stats-grid"><article><span>كل الطلبات</span><b id="statTotal">0</b></article><article><span>طلبات جديدة</span><b id="statFresh">0</b></article><article><span>قيد المتابعة</span><b id="statActive">0</b></article><article><span>مكتملة</span><b id="statCompleted">0</b></article></div>
+      <div class="requests-head"><h2>طلبات العملاء</h2><button class="btn ghost" id="refreshBtn">تحديث القائمة ↻</button></div>
+      <div id="requestsList" class="requests-list"><p class="muted">جارٍ تحميل الطلبات...</p></div>
+    </section>
+  </main>
+  <script src="/admin.js"></script>
+</body>
+</html>
+
+
+================================================================================
+FILE: public/admin.js
+================================================================================
+
+const loginPanel = document.getElementById("loginPanel");
+const dashboard = document.getElementById("dashboard");
+const loginForm = document.getElementById("loginForm");
+const loginMessage = document.getElementById("loginMessage");
+const requestsList = document.getElementById("requestsList");
+const statusLabels = { new: "جديد", reviewing: "قيد المراجعة", in_progress: "قيد التنفيذ", completed: "مكتمل", rejected: "مرفوض" };
+
+async function api(url, options = {}) {
+  const response = await fetch(url, { ...options, headers: { "Content-Type": "application/json", ...(options.headers || {}) } });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "حدث خطأ في الاتصال.");
+  return data;
+}
+function showDashboard() { loginPanel.hidden = true; dashboard.hidden = false; loadDashboard(); }
+async function checkSession() {
+  try { await api("/api/admin/me"); showDashboard(); } catch { loginPanel.hidden = false; dashboard.hidden = true; }
+}
+loginForm.addEventListener("submit", async e => {
+  e.preventDefault();
+  const button = loginForm.querySelector("button");
+  button.disabled = true; loginMessage.textContent = "";
+  try {
+    const payload = Object.fromEntries(new FormData(loginForm).entries());
+    await api("/api/admin/login", { method: "POST", body: JSON.stringify(payload) });
+    loginForm.reset(); showDashboard();
+  } catch (err) { loginMessage.textContent = err.message; loginMessage.style.color = "#ff91ad"; }
+  finally { button.disabled = false; }
+});
+document.getElementById("logoutBtn").addEventListener("click", async () => {
+  try { await api("/api/admin/logout", { method: "POST" }); } finally { loginPanel.hidden = false; dashboard.hidden = true; }
+});
+document.getElementById("refreshBtn").addEventListener("click", loadDashboard);
+
+async function loadDashboard() {
+  try {
+    const [stats, requests] = await Promise.all([api("/api/admin/stats"), api("/api/admin/requests")]);
+    document.getElementById("statTotal").textContent = stats.total;
+    document.getElementById("statFresh").textContent = stats.fresh;
+    document.getElementById("statActive").textContent = stats.active;
+    document.getElementById("statCompleted").textContent = stats.completed;
+    renderRequests(requests);
+  } catch (err) { requestsList.textContent = err.message; }
+}
+function make(tag, className, text) {
+  const el = document.createElement(tag);
+  if (className) el.className = className;
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+function renderRequests(requests) {
+  requestsList.replaceChildren();
+  if (!requests.length) { requestsList.append(make("p", "muted", "لا توجد طلبات حتى الآن.")); return; }
+  requests.forEach(item => {
+    const card = make("article", "request-card");
+    const top = make("div", "request-top");
+    const titleWrap = make("div");
+    titleWrap.append(make("h3", "", `طلب #${item.id} — ${item.name}`));
+    titleWrap.append(make("div", "request-meta", `${item.email} • ${item.phone} • ${item.service}`));
+    top.append(titleWrap, make("strong", "", statusLabels[item.status] || item.status));
+    card.append(top);
+    card.append(make("p", "", item.details));
+    if (item.budget) card.append(make("div", "request-meta", `الميزانية: ${item.budget}`));
+    card.append(make("div", "request-meta", `تاريخ الاستلام: ${item.created_at}`));
+    const actions = make("div", "request-actions");
+    const select = document.createElement("select");
+    Object.entries(statusLabels).forEach(([value, label]) => {
+      const option = document.createElement("option"); option.value = value; option.textContent = label; option.selected = value === item.status; select.append(option);
+    });
+    select.addEventListener("change", async () => {
+      try { await api(`/api/admin/requests/${item.id}`, { method: "PATCH", body: JSON.stringify({ status: select.value }) }); await loadDashboard(); }
+      catch (err) { alert(err.message); }
+    });
+    const del = make("button", "small-btn danger", "حذف الطلب");
+    del.addEventListener("click", async () => {
+      if (!confirm(`هل تريد حذف الطلب رقم ${item.id}؟`)) return;
+      try { await api(`/api/admin/requests/${item.id}`, { method: "DELETE" }); await loadDashboard(); }
+      catch (err) { alert(err.message); }
+    });
+    actions.append(select, del); card.append(actions); requestsList.append(card);
+  });
+}
+checkSession();
+
+
+================================================================================
+FILE: README.md
+================================================================================
+
+# NOVYX — Company Website
+
+A responsive Arabic RTL company website with:
+- Public services and company profile pages.
+- Project request form saved to SQLite.
+- Separate admin login and dashboard.
+- Admin request status updates and deletion.
+- Password hashing, secure session cookies, rate limits, and security headers.
+
+## Requirements
+- Node.js 20 or newer
+- npm
+
+## Run locally
+1. Extract the ZIP.
+2. Open the project folder in a terminal.
+3. Install dependencies:
+   `npm install`
+4. Copy `.env.example` to `.env`.
+5. Change `SESSION_SECRET` to a long random string (32+ characters).
+6. Change `ADMIN_USERNAME` and `ADMIN_PASSWORD`. Use a unique password of at least 12 characters.
+7. Start:
+   `npm start`
+8. Open `http://localhost:3000`.
+9. Admin dashboard: `http://localhost:3000/admin.html`
+
+The first startup creates the admin account if it does not already exist. The SQLite database is created in `data/novyx.sqlite`.
+
+## Important deployment notes
+- Deploy on a Node.js host that supports persistent disk storage.
+- Set the environment variables in the host dashboard; do not upload `.env`.
+- Set `NODE_ENV=production` and use HTTPS in production.
+- Keep the `data/` directory on persistent storage and back it up.
+- If you change `ADMIN_PASSWORD` after the admin record is created, the existing database password hash will not automatically change. For a password reset, back up the database, delete the admin row with a secure DB tool, and restart with the new environment values, or implement a password-change workflow.
+- Do not use ephemeral/serverless hosting without persistent storage for this SQLite setup.
+- The site currently stores customer requests in the database; it does not yet send email, WhatsApp messages, accept payments, or provide customer accounts.
+
+
+================================================================================
+FILE: .gitignore
+================================================================================
+
+node_modules/
+.env
+data/
+*.db
+*.sqlite
+.DS_Store
+
